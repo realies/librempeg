@@ -25,6 +25,7 @@
 
 #include "config_components.h"
 
+#include <inttypes.h>
 #include "libavutil/avassert.h"
 #include "libavutil/opt.h"
 #include "audio.h"
@@ -46,6 +47,13 @@ typedef struct AudioFadeContext {
     int passthrough;
     int64_t pts;
 
+    /* Ring buffer for lazy crossfade (memory-efficient) */
+    AVFrame *ring_buf;          /* Ring buffer holding last nb_samples from input 0 */
+    int64_t ring_write_pos;     /* Write position in ring buffer (monotonically increasing) */
+    int64_t ring_filled;        /* Number of valid samples in ring buffer */
+    int64_t crossfade_pos;      /* Current position within crossfade (0 to nb_samples) */
+    int crossfade_active;       /* Flag: currently in crossfade processing mode */
+
     void (*fade_samples)(uint8_t **dst, uint8_t * const *src,
                          int nb_samples, int channels, int direction,
                          int64_t start, int64_t range, int curve,
@@ -55,7 +63,8 @@ typedef struct AudioFadeContext {
     void (*crossfade_samples)(uint8_t **dst, uint8_t * const *cf0,
                               uint8_t * const *cf1,
                               int nb_samples, int channels,
-                              int curve0, int curve1);
+                              int curve0, int curve1,
+                              int64_t offset, int64_t total);
 } AudioFadeContext;
 
 enum CurveType { NONE = -1, TRI, QSIN, ESIN, HSIN, LOG, IPAR, QUA, CUB, SQU, CBR, PAR, EXP, IQSIN, IHSIN, DESE, DESI, LOSI, SINC, ISINC, QUAT, QUATR, QSIN2, HSIN2, NB_CURVES };
@@ -290,10 +299,10 @@ const FFFilter ff_af_afade = {
 #if CONFIG_ACROSSFADE_FILTER
 
 static const AVOption acrossfade_options[] = {
-    { "nb_samples",   "set number of samples for cross fade duration", OFFSET(nb_samples),   AV_OPT_TYPE_INT64,  {.i64 = 44100}, 1, INT32_MAX/10, FLAGS },
-    { "ns",           "set number of samples for cross fade duration", OFFSET(nb_samples),   AV_OPT_TYPE_INT64,  {.i64 = 44100}, 1, INT32_MAX/10, FLAGS },
-    { "duration",     "set cross fade duration",                       OFFSET(duration),     AV_OPT_TYPE_DURATION, {.i64 = 0 },  0, 60000000, FLAGS },
-    { "d",            "set cross fade duration",                       OFFSET(duration),     AV_OPT_TYPE_DURATION, {.i64 = 0 },  0, 60000000, FLAGS },
+    { "nb_samples",   "set number of samples for cross fade duration", OFFSET(nb_samples),   AV_OPT_TYPE_INT64,  {.i64 = 44100}, 1, INT_MAX, FLAGS },
+    { "ns",           "set number of samples for cross fade duration", OFFSET(nb_samples),   AV_OPT_TYPE_INT64,  {.i64 = 44100}, 1, INT_MAX, FLAGS },
+    { "duration",     "set cross fade duration",                       OFFSET(duration),     AV_OPT_TYPE_DURATION, {.i64 = 0 },  0, INT64_MAX/2, FLAGS },
+    { "d",            "set cross fade duration",                       OFFSET(duration),     AV_OPT_TYPE_DURATION, {.i64 = 0 },  0, INT64_MAX/2, FLAGS },
     { "overlap",      "overlap 1st stream end with 2nd stream start",  OFFSET(overlap),      AV_OPT_TYPE_BOOL,   {.i64 = 1    }, 0,  1, FLAGS },
     { "o",            "overlap 1st stream end with 2nd stream start",  OFFSET(overlap),      AV_OPT_TYPE_BOOL,   {.i64 = 1    }, 0,  1, FLAGS },
     { "curve1",       "set fade curve type for 1st stream",            OFFSET(curve),        AV_OPT_TYPE_INT,    {.i64 = TRI  }, NONE, NB_CURVES - 1, FLAGS, .unit = "curve" },
@@ -329,156 +338,506 @@ static const AVOption acrossfade_options[] = {
 
 AVFILTER_DEFINE_CLASS(acrossfade);
 
-static int check_input(AVFilterLink *inlink)
+/* Copy samples from frame to ring buffer (circular overwrite) */
+static void copy_to_ring_buffer(AudioFadeContext *s, AVFrame *frame, int nb_channels, int is_planar)
 {
-    const int queued_samples = ff_inlink_queued_samples(inlink);
+    int bytes_per_sample = av_get_bytes_per_sample(frame->format);
+    /* Clamp to ring buffer size; if frame is larger, keep only the last nb_samples */
+    int samples_to_copy = FFMIN(frame->nb_samples, s->nb_samples);
+    int src_offset = frame->nb_samples - samples_to_copy;
+    int64_t dst_pos = s->ring_write_pos % s->nb_samples;
+    int first_chunk = FFMIN(samples_to_copy, s->nb_samples - dst_pos);
+    int second_chunk = samples_to_copy - first_chunk;
 
-    return ff_inlink_check_available_samples(inlink, queued_samples + 1) == 1;
+    if (is_planar) {
+        for (int c = 0; c < nb_channels; c++) {
+            memcpy(s->ring_buf->extended_data[c] + dst_pos * bytes_per_sample,
+                   frame->extended_data[c] + src_offset * bytes_per_sample,
+                   first_chunk * bytes_per_sample);
+            if (second_chunk > 0)
+                memcpy(s->ring_buf->extended_data[c],
+                       frame->extended_data[c] + (src_offset + first_chunk) * bytes_per_sample,
+                       second_chunk * bytes_per_sample);
+        }
+    } else {
+        int stride = nb_channels * bytes_per_sample;
+        memcpy(s->ring_buf->extended_data[0] + dst_pos * stride,
+               frame->extended_data[0] + src_offset * stride,
+               first_chunk * stride);
+        if (second_chunk > 0)
+            memcpy(s->ring_buf->extended_data[0],
+                   frame->extended_data[0] + (src_offset + first_chunk) * stride,
+                   second_chunk * stride);
+    }
+
+    s->ring_write_pos += samples_to_copy;
+    s->ring_filled = FFMIN(s->ring_filled + samples_to_copy, s->nb_samples);
 }
 
-static int pass_frame(AVFilterLink *inlink, AVFilterLink *outlink, int64_t *pts)
+/* Read samples from ring buffer starting at crossfade_pos (circular read) */
+static void read_from_ring_buffer(AudioFadeContext *s, uint8_t **dst, int nb_samples,
+                                  int nb_channels, int is_planar, int bytes_per_sample)
 {
-    AVFrame *in;
-    int ret = ff_inlink_consume_frame(inlink, &in);
-    if (ret < 0)
-        return ret;
-    av_assert1(ret);
-    in->pts = *pts;
-    *pts += av_rescale_q(in->nb_samples,
-            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
-    return ff_filter_frame(outlink, in);
+    int64_t oldest_pos = (s->ring_write_pos - s->ring_filled + s->nb_samples) % s->nb_samples;
+    int64_t read_start = (oldest_pos + s->crossfade_pos) % s->nb_samples;
+    int first_chunk = FFMIN(nb_samples, s->nb_samples - read_start);
+    int second_chunk = nb_samples - first_chunk;
+
+    av_assert0(nb_samples <= s->ring_filled - s->crossfade_pos);
+
+    if (is_planar) {
+        for (int c = 0; c < nb_channels; c++) {
+            memcpy(dst[c],
+                   s->ring_buf->extended_data[c] + read_start * bytes_per_sample,
+                   first_chunk * bytes_per_sample);
+            if (second_chunk > 0)
+                memcpy(dst[c] + first_chunk * bytes_per_sample,
+                       s->ring_buf->extended_data[c],
+                       second_chunk * bytes_per_sample);
+        }
+    } else {
+        int stride = nb_channels * bytes_per_sample;
+        memcpy(dst[0],
+               s->ring_buf->extended_data[0] + read_start * stride,
+               first_chunk * stride);
+        if (second_chunk > 0)
+            memcpy(dst[0] + first_chunk * stride,
+                   s->ring_buf->extended_data[0],
+                   second_chunk * stride);
+    }
 }
 
-static int pass_samples(AVFilterLink *inlink, AVFilterLink *outlink, unsigned nb_samples, int64_t *pts)
-{
-    AVFrame *in;
-    int ret = ff_inlink_consume_samples(inlink, nb_samples, nb_samples, &in);
-    if (ret < 0)
-        return ret;
-    av_assert1(ret);
-    in->pts = *pts;
-    *pts += av_rescale_q(in->nb_samples,
-            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
-    return ff_filter_frame(outlink, in);
-}
-
-static int pass_crossfade(AVFilterContext *ctx)
+/* Process crossfade for non-overlap mode (fade-out then fade-in) */
+static int process_non_overlap_crossfade(AVFilterContext *ctx, const int idx1)
 {
     AudioFadeContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
-    AVFrame *out, *cf[2] = { NULL };
+    AVFilterLink *in1 = ctx->inputs[idx1];
+    AVFrame *out, *cf = NULL;
     int ret;
 
-    if (s->overlap) {
-        out = ff_get_audio_buffer(outlink, s->nb_samples);
+    /* Phase 1: Fade-out from ring buffer */
+    if (s->crossfade_pos < s->ring_filled) {
+        int64_t remaining = s->ring_filled - s->crossfade_pos;
+        int process_samples = FFMIN(remaining, 4096);
+        int bytes_per_sample = av_get_bytes_per_sample(outlink->format);
+        int is_planar = av_sample_fmt_is_planar(outlink->format);
+        int nb_channels = outlink->ch_layout.nb_channels;
+
+        out = ff_get_audio_buffer(outlink, process_samples);
         if (!out)
             return AVERROR(ENOMEM);
 
-        ret = ff_inlink_consume_samples(ctx->inputs[0], s->nb_samples, s->nb_samples, &cf[0]);
-        if (ret < 0) {
+        AVFrame *temp = ff_get_audio_buffer(outlink, process_samples);
+        if (!temp) {
             av_frame_free(&out);
-            return ret;
-        }
-
-        ret = ff_inlink_consume_samples(ctx->inputs[1], s->nb_samples, s->nb_samples, &cf[1]);
-        if (ret < 0) {
-            av_frame_free(&out);
-            return ret;
-        }
-
-        s->crossfade_samples(out->extended_data, cf[0]->extended_data,
-                             cf[1]->extended_data,
-                             s->nb_samples, out->ch_layout.nb_channels,
-                             s->curve, s->curve2);
-        out->pts = s->pts;
-        s->pts += av_rescale_q(s->nb_samples,
-            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
-        s->passthrough = 1;
-        ff_graph_frame_free(ctx, &cf[0]);
-        ff_graph_frame_free(ctx, &cf[1]);
-        return ff_filter_frame(outlink, out);
-    } else {
-        out = ff_get_audio_buffer(outlink, s->nb_samples);
-        if (!out)
             return AVERROR(ENOMEM);
-
-        ret = ff_inlink_consume_samples(ctx->inputs[0], s->nb_samples, s->nb_samples, &cf[0]);
-        if (ret < 0) {
-            av_frame_free(&out);
-            return ret;
         }
 
-        s->fade_samples(out->extended_data, cf[0]->extended_data, s->nb_samples,
-                        outlink->ch_layout.nb_channels, -1, s->nb_samples - 1, s->nb_samples, s->curve, 0., 1.);
+        read_from_ring_buffer(s, temp->extended_data, process_samples,
+                              nb_channels, is_planar, bytes_per_sample);
+
+        s->fade_samples(out->extended_data, temp->extended_data, process_samples,
+                        nb_channels, -1, s->ring_filled - 1 - s->crossfade_pos,
+                        s->ring_filled, s->curve, 0., 1.);
+
+        s->crossfade_pos += process_samples;
         out->pts = s->pts;
-        s->pts += av_rescale_q(s->nb_samples,
+        s->pts += av_rescale_q(process_samples,
             (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
-        ff_graph_frame_free(ctx, &cf[0]);
-        ret = ff_filter_frame(outlink, out);
-        if (ret < 0)
-            return ret;
-
-        out = ff_get_audio_buffer(outlink, s->nb_samples);
-        if (!out)
-            return AVERROR(ENOMEM);
-
-        ret = ff_inlink_consume_samples(ctx->inputs[1], s->nb_samples, s->nb_samples, &cf[1]);
-        if (ret < 0) {
-            av_frame_free(&out);
-            return ret;
-        }
-
-        s->fade_samples(out->extended_data, cf[1]->extended_data, s->nb_samples,
-                        outlink->ch_layout.nb_channels, 1, 0, s->nb_samples, s->curve2, 0., 1.);
-        out->pts = s->pts;
-        s->pts += av_rescale_q(s->nb_samples,
-            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
-        s->passthrough = 1;
-        ff_graph_frame_free(ctx, &cf[1]);
+        av_frame_free(&temp);
         return ff_filter_frame(outlink, out);
     }
+
+    /* Phase 2: Fade-in from input 1 */
+    if (!ff_inlink_queued_samples(in1)) {
+        int status;
+        if (ff_inlink_acknowledge_status(in1, &status, NULL)) {
+            s->crossfade_active = 0;
+            s->passthrough = 0;
+            ff_outlink_set_status(outlink, status, s->pts);
+            return 0;
+        }
+        FF_FILTER_FORWARD_WANTED(outlink, in1);
+        return FFERROR_NOT_READY;
+    }
+
+    ret = ff_inlink_consume_frame(in1, &cf);
+    if (ret < 0)
+        return ret;
+    if (!ret) {
+        FF_FILTER_FORWARD_WANTED(outlink, in1);
+        return FFERROR_NOT_READY;
+    }
+
+    int64_t fadein_pos = s->crossfade_pos - s->ring_filled;
+    int64_t fadein_remaining = s->ring_filled - fadein_pos;
+
+    if (fadein_pos < s->ring_filled && fadein_remaining > 0) {
+        int process_samples = FFMIN(cf->nb_samples, fadein_remaining);
+
+        out = ff_get_audio_buffer(outlink, cf->nb_samples);
+        if (!out) {
+            av_frame_free(&cf);
+            return AVERROR(ENOMEM);
+        }
+
+        s->fade_samples(out->extended_data, cf->extended_data, process_samples,
+                        outlink->ch_layout.nb_channels, 1, fadein_pos,
+                        s->ring_filled, s->curve2, 0., 1.);
+
+        if (cf->nb_samples > process_samples) {
+            int bytes_per_sample = av_get_bytes_per_sample(outlink->format);
+            int is_planar = av_sample_fmt_is_planar(outlink->format);
+            int nb_channels = outlink->ch_layout.nb_channels;
+
+            if (is_planar) {
+                for (int c = 0; c < nb_channels; c++) {
+                    memcpy(out->extended_data[c] + process_samples * bytes_per_sample,
+                           cf->extended_data[c] + process_samples * bytes_per_sample,
+                           (cf->nb_samples - process_samples) * bytes_per_sample);
+                }
+            } else {
+                memcpy(out->extended_data[0] + process_samples * nb_channels * bytes_per_sample,
+                       cf->extended_data[0] + process_samples * nb_channels * bytes_per_sample,
+                       (cf->nb_samples - process_samples) * nb_channels * bytes_per_sample);
+            }
+        }
+
+        s->crossfade_pos += cf->nb_samples;
+        out->pts = s->pts;
+        s->pts += av_rescale_q(cf->nb_samples,
+            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+        av_frame_free(&cf);
+
+        if (s->crossfade_pos >= s->ring_filled * 2) {
+            s->crossfade_active = 0;
+        }
+
+        return ff_filter_frame(outlink, out);
+    }
+
+    /* Past crossfade region - pass through */
+    s->crossfade_active = 0;
+    cf->pts = s->pts;
+    s->pts += av_rescale_q(cf->nb_samples,
+            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+    return ff_filter_frame(outlink, cf);
+}
+
+/* Process overlap crossfade incrementally from ring buffer and input 1 */
+static int process_overlap_crossfade(AVFilterContext *ctx, const int idx1)
+{
+    AudioFadeContext *s = ctx->priv;
+    AVFilterLink *outlink = ctx->outputs[0];
+    AVFilterLink *in1 = ctx->inputs[idx1];
+    int bytes_per_sample = av_get_bytes_per_sample(outlink->format);
+    int is_planar = av_sample_fmt_is_planar(outlink->format);
+    int nb_channels = outlink->ch_layout.nb_channels;
+    AVFrame *out, *cf1 = NULL;
+    int ret;
+
+    int64_t remaining = s->ring_filled - s->crossfade_pos;
+    if (remaining <= 0) {
+        s->crossfade_active = 0;
+        return 0;
+    }
+
+    if (!ff_inlink_queued_samples(in1)) {
+        int status;
+        if (ff_inlink_acknowledge_status(in1, &status, NULL)) {
+            /* Input 1 ended early - fade out remaining ring buffer */
+            int process_samples = FFMIN(remaining, 4096);
+
+            out = ff_get_audio_buffer(outlink, process_samples);
+            if (!out)
+                return AVERROR(ENOMEM);
+
+            AVFrame *temp = ff_get_audio_buffer(outlink, process_samples);
+            if (!temp) {
+                av_frame_free(&out);
+                return AVERROR(ENOMEM);
+            }
+
+            read_from_ring_buffer(s, temp->extended_data, process_samples,
+                                  nb_channels, is_planar, bytes_per_sample);
+
+            s->fade_samples(out->extended_data, temp->extended_data, process_samples,
+                            nb_channels, -1, s->ring_filled - 1 - s->crossfade_pos,
+                            s->ring_filled, s->curve, 0., 1.);
+
+            s->crossfade_pos += process_samples;
+            out->pts = s->pts;
+            s->pts += av_rescale_q(process_samples,
+                (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+            av_frame_free(&temp);
+
+            if (s->crossfade_pos >= s->ring_filled)
+                s->crossfade_active = 0;
+
+            return ff_filter_frame(outlink, out);
+        }
+        FF_FILTER_FORWARD_WANTED(outlink, in1);
+        return FFERROR_NOT_READY;
+    }
+
+    ret = ff_inlink_consume_frame(in1, &cf1);
+    if (ret < 0)
+        return ret;
+    if (!ret) {
+        FF_FILTER_FORWARD_WANTED(outlink, in1);
+        return FFERROR_NOT_READY;
+    }
+
+    int process_samples = FFMIN(cf1->nb_samples, remaining);
+
+    out = ff_get_audio_buffer(outlink, process_samples);
+    if (!out) {
+        av_frame_free(&cf1);
+        return AVERROR(ENOMEM);
+    }
+
+    AVFrame *temp = ff_get_audio_buffer(outlink, process_samples);
+    if (!temp) {
+        av_frame_free(&out);
+        av_frame_free(&cf1);
+        return AVERROR(ENOMEM);
+    }
+
+    read_from_ring_buffer(s, temp->extended_data, process_samples,
+                          nb_channels, is_planar, bytes_per_sample);
+
+    s->crossfade_samples(out->extended_data, temp->extended_data,
+                         cf1->extended_data, process_samples, nb_channels,
+                         s->curve, s->curve2, s->crossfade_pos, s->ring_filled);
+
+    s->crossfade_pos += process_samples;
+    out->pts = s->pts;
+    s->pts += av_rescale_q(process_samples,
+        (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+
+    av_frame_free(&temp);
+
+    /* If we didn't use all of cf1, output the rest */
+    if (cf1->nb_samples > process_samples) {
+        AVFrame *remainder = ff_get_audio_buffer(outlink, cf1->nb_samples - process_samples);
+        if (!remainder) {
+            av_frame_free(&cf1);
+            av_frame_free(&out);
+            return AVERROR(ENOMEM);
+        }
+        if (is_planar) {
+            for (int c = 0; c < nb_channels; c++) {
+                memcpy(remainder->extended_data[c],
+                       cf1->extended_data[c] + process_samples * bytes_per_sample,
+                       (cf1->nb_samples - process_samples) * bytes_per_sample);
+            }
+        } else {
+            memcpy(remainder->extended_data[0],
+                   cf1->extended_data[0] + process_samples * nb_channels * bytes_per_sample,
+                   (cf1->nb_samples - process_samples) * nb_channels * bytes_per_sample);
+        }
+        remainder->pts = s->pts;
+        s->pts += av_rescale_q(cf1->nb_samples - process_samples,
+            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+        av_frame_free(&cf1);
+        s->crossfade_active = 0;
+        ret = ff_filter_frame(outlink, out);
+        if (ret < 0) {
+            av_frame_free(&remainder);
+            return ret;
+        }
+        return ff_filter_frame(outlink, remainder);
+    }
+
+    av_frame_free(&cf1);
+
+    if (s->crossfade_pos >= s->ring_filled)
+        s->crossfade_active = 0;
+
+    return ff_filter_frame(outlink, out);
 }
 
 static int activate(AVFilterContext *ctx)
 {
-    AudioFadeContext *s   = ctx->priv;
+    AudioFadeContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
-    int ret = 0, nb_samples;
+    const int idx1 = 1;
+    int ret = 0;
 
     FF_FILTER_FORWARD_STATUS_BACK_ALL(outlink, ctx);
 
+    /* If crossfade is active, process it */
+    if (s->crossfade_active) {
+        if (s->overlap)
+            ret = process_overlap_crossfade(ctx, idx1);
+        else
+            ret = process_non_overlap_crossfade(ctx, idx1);
+
+        if (ret < 0)
+            return ret;
+
+        if (!s->crossfade_active) {
+            s->passthrough = 1;
+        }
+        return ret;
+    }
+
+    /* After crossfade: pass through input 1 */
     if (s->passthrough && s->status[0]) {
-        if (ff_inlink_queued_frames(ctx->inputs[1]))
-            return pass_frame(ctx->inputs[1], outlink, &s->pts);
+        if (ff_inlink_queued_frames(ctx->inputs[1])) {
+            AVFrame *f = NULL;
+            ret = ff_inlink_consume_frame(ctx->inputs[1], &f);
+            if (ret < 0)
+                return ret;
+            if (f) {
+                f->pts = s->pts;
+                s->pts += av_rescale_q(f->nb_samples,
+                    (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+                return ff_filter_frame(outlink, f);
+            }
+        }
         FF_FILTER_FORWARD_STATUS(ctx->inputs[1], outlink);
         FF_FILTER_FORWARD_WANTED(outlink, ctx->inputs[1]);
     }
 
-    nb_samples = ff_inlink_queued_samples(ctx->inputs[0]);
-    if (nb_samples  > s->nb_samples) {
-        nb_samples -= s->nb_samples;
-        s->passthrough = 1;
-        return pass_samples(ctx->inputs[0], outlink, nb_samples, &s->pts);
-    } else if (s->status[0] && nb_samples >= s->nb_samples &&
-               ff_inlink_queued_samples(ctx->inputs[1]) >= s->nb_samples) {
-        return pass_crossfade(ctx);
-    } else if (ff_outlink_frame_wanted(outlink)) {
-        if (!s->status[0] && check_input(ctx->inputs[0]))
-            s->status[0] = AVERROR_EOF;
-        s->passthrough = !s->status[0];
-        if (check_input(ctx->inputs[1])) {
-            s->status[1] = AVERROR_EOF;
-            ff_outlink_set_status(outlink, AVERROR_EOF, AV_NOPTS_VALUE);
-            return 0;
-        }
-        if (!s->status[0])
-            ff_inlink_request_frame(ctx->inputs[0]);
-        else
-            ff_inlink_request_frame(ctx->inputs[1]);
-        return 0;
+    /* Allocate ring buffer if needed */
+    if (!s->ring_buf) {
+        s->ring_buf = ff_get_audio_buffer(outlink, (int)s->nb_samples);
+        if (!s->ring_buf)
+            return AVERROR(ENOMEM);
     }
 
-    return ret;
+    /* Process input 0 */
+    if (!s->status[0]) {
+        AVFrame *frame = NULL;
+        ret = ff_inlink_consume_frame(ctx->inputs[0], &frame);
+        if (ret < 0)
+            return ret;
+
+        if (ret > 0) {
+            int nb_channels = outlink->ch_layout.nb_channels;
+            int is_planar = av_sample_fmt_is_planar(outlink->format);
+            int bytes_per_sample = av_get_bytes_per_sample(outlink->format);
+
+            if (s->overlap) {
+                /* Overlap mode: delay output by nb_samples */
+                int64_t total_received = s->ring_write_pos + frame->nb_samples;
+
+                if (total_received <= s->nb_samples) {
+                    /* Still filling the delay buffer */
+                    copy_to_ring_buffer(s, frame, nb_channels, is_planar);
+                    av_frame_free(&frame);
+                    ff_inlink_request_frame(ctx->inputs[0]);
+                    return 0;
+                } else {
+                    /* Have enough to start outputting */
+                    int64_t excess = total_received - s->nb_samples;
+
+                    if (s->ring_write_pos < s->nb_samples) {
+                        /* Transition: ring buffer about to become full */
+                        int64_t to_output = FFMIN(excess, s->ring_filled);
+
+                        if (to_output <= 0) {
+                            /* Nothing in ring yet (first frame larger than delay) */
+                            copy_to_ring_buffer(s, frame, nb_channels, is_planar);
+                            av_frame_free(&frame);
+                            ff_inlink_request_frame(ctx->inputs[0]);
+                            return 0;
+                        }
+
+                        AVFrame *out = ff_get_audio_buffer(outlink, (int)to_output);
+                        if (!out) {
+                            av_frame_free(&frame);
+                            return AVERROR(ENOMEM);
+                        }
+
+                        /* Read oldest samples BEFORE writing (FIFO delay semantics) */
+                        read_from_ring_buffer(s, out->extended_data, (int)to_output,
+                                              nb_channels, is_planar, bytes_per_sample);
+
+                        /* Now add entire new frame to ring */
+                        copy_to_ring_buffer(s, frame, nb_channels, is_planar);
+
+                        out->pts = s->pts;
+                        s->pts += av_rescale_q((int)to_output,
+                            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+
+                        av_frame_free(&frame);
+                        return ff_filter_frame(outlink, out);
+                    } else {
+                        /* Steady state: output oldest from ring, add new to ring */
+                        int from_ring = FFMIN(frame->nb_samples, s->ring_filled);
+                        int from_frame = frame->nb_samples - from_ring;
+
+                        AVFrame *out = ff_get_audio_buffer(outlink, frame->nb_samples);
+                        if (!out) {
+                            av_frame_free(&frame);
+                            return AVERROR(ENOMEM);
+                        }
+
+                        /* Read delayed samples from ring */
+                        if (from_ring > 0)
+                            read_from_ring_buffer(s, out->extended_data, from_ring,
+                                                  nb_channels, is_planar, bytes_per_sample);
+
+                        /* Copy excess directly from new frame (beyond delay capacity) */
+                        if (from_frame > 0) {
+                            int offset = frame->nb_samples - from_frame;
+                            if (is_planar) {
+                                for (int c = 0; c < nb_channels; c++)
+                                    memcpy(out->extended_data[c] + from_ring * bytes_per_sample,
+                                           frame->extended_data[c] + offset * bytes_per_sample,
+                                           from_frame * bytes_per_sample);
+                            } else {
+                                memcpy(out->extended_data[0] + from_ring * nb_channels * bytes_per_sample,
+                                       frame->extended_data[0] + offset * nb_channels * bytes_per_sample,
+                                       from_frame * nb_channels * bytes_per_sample);
+                            }
+                        }
+
+                        copy_to_ring_buffer(s, frame, nb_channels, is_planar);
+
+                        out->pts = s->pts;
+                        s->pts += av_rescale_q(frame->nb_samples,
+                            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+
+                        av_frame_free(&frame);
+                        return ff_filter_frame(outlink, out);
+                    }
+                }
+            } else {
+                /* Non-overlap mode: pass through immediately, keep copy in ring buffer */
+                copy_to_ring_buffer(s, frame, nb_channels, is_planar);
+
+                frame->pts = s->pts;
+                s->pts += av_rescale_q(frame->nb_samples,
+                    (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+                return ff_filter_frame(outlink, frame);
+            }
+        }
+
+        if (ff_inlink_acknowledge_status(ctx->inputs[0], &s->status[0], NULL)) {
+            /* Input 0 ended - start crossfade */
+            s->crossfade_active = 1;
+            s->crossfade_pos = 0;
+            ff_filter_set_ready(ctx, 10);
+            return 0;
+        }
+
+        if (ff_outlink_frame_wanted(outlink)) {
+            ff_inlink_request_frame(ctx->inputs[0]);
+            return 0;
+        }
+    }
+
+    return FFERROR_NOT_READY;
+}
+
+static av_cold void uninit(AVFilterContext *ctx)
+{
+    AudioFadeContext *s = ctx->priv;
+    av_frame_free(&s->ring_buf);
 }
 
 static int acrossfade_config_output(AVFilterLink *outlink)
@@ -501,6 +860,12 @@ static int acrossfade_config_output(AVFilterLink *outlink)
     }
 
     config_output(outlink);
+
+    if (s->nb_samples > INT_MAX) {
+        av_log(ctx, AV_LOG_ERROR, "nb_samples %" PRId64 " exceeds maximum %d\n",
+               s->nb_samples, INT_MAX);
+        return AVERROR(EINVAL);
+    }
 
     return 0;
 }
@@ -542,6 +907,7 @@ const FFFilter ff_af_acrossfade = {
     .p.priv_class  = &acrossfade_class,
     .priv_size     = sizeof(AudioFadeContext),
     .activate      = activate,
+    .uninit        = uninit,
     FILTER_INPUTS(acrossfade_inputs),
     FILTER_OUTPUTS(acrossfade_outputs),
     FILTER_SAMPLEFMTS_ARRAY(sample_fmts),
