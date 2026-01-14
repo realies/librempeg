@@ -374,16 +374,17 @@ static void copy_to_ring_buffer(AudioFadeContext *s, AVFrame *frame, int nb_chan
     s->ring_filled = FFMIN(s->ring_filled + samples_to_copy, s->nb_samples);
 }
 
-/* Read samples from ring buffer starting at crossfade_pos (circular read) */
-static void read_from_ring_buffer(AudioFadeContext *s, uint8_t **dst, int nb_samples,
-                                  int nb_channels, int is_planar, int bytes_per_sample)
+/* Read samples from ring buffer at given offset from oldest data (circular read) */
+static void read_from_ring_buffer(AudioFadeContext *s, uint8_t **dst, int samples_to_read,
+                                  int nb_channels, int is_planar, int bytes_per_sample,
+                                  int64_t read_offset)
 {
     int64_t oldest_pos = (s->ring_write_pos - s->ring_filled + s->nb_samples) % s->nb_samples;
-    int64_t read_start = (oldest_pos + s->crossfade_pos) % s->nb_samples;
-    int first_chunk = FFMIN(nb_samples, s->nb_samples - read_start);
-    int second_chunk = nb_samples - first_chunk;
+    int64_t read_start = (oldest_pos + read_offset) % s->nb_samples;
+    int first_chunk = FFMIN(samples_to_read, s->nb_samples - read_start);
+    int second_chunk = samples_to_read - first_chunk;
 
-    av_assert0(nb_samples <= s->ring_filled - s->crossfade_pos);
+    av_assert0(samples_to_read <= s->ring_filled - read_offset);
 
     if (is_planar) {
         for (int c = 0; c < nb_channels; c++) {
@@ -435,7 +436,8 @@ static int process_non_overlap_crossfade(AVFilterContext *ctx, const int idx1)
         }
 
         read_from_ring_buffer(s, temp->extended_data, process_samples,
-                              nb_channels, is_planar, bytes_per_sample);
+                              nb_channels, is_planar, bytes_per_sample,
+                              s->crossfade_pos);
 
         s->fade_samples(out->extended_data, temp->extended_data, process_samples,
                         nb_channels, -1, s->ring_filled - 1 - s->crossfade_pos,
@@ -560,7 +562,8 @@ static int process_overlap_crossfade(AVFilterContext *ctx, const int idx1)
             }
 
             read_from_ring_buffer(s, temp->extended_data, process_samples,
-                                  nb_channels, is_planar, bytes_per_sample);
+                                  nb_channels, is_planar, bytes_per_sample,
+                                  s->crossfade_pos);
 
             s->fade_samples(out->extended_data, temp->extended_data, process_samples,
                             nb_channels, -1, s->ring_filled - 1 - s->crossfade_pos,
@@ -605,7 +608,8 @@ static int process_overlap_crossfade(AVFilterContext *ctx, const int idx1)
     }
 
     read_from_ring_buffer(s, temp->extended_data, process_samples,
-                          nb_channels, is_planar, bytes_per_sample);
+                          nb_channels, is_planar, bytes_per_sample,
+                          s->crossfade_pos);
 
     s->crossfade_samples(out->extended_data, temp->extended_data,
                          cf1->extended_data, process_samples, nb_channels,
@@ -754,7 +758,7 @@ static int activate(AVFilterContext *ctx)
 
                         /* Read oldest samples BEFORE writing (FIFO delay semantics) */
                         read_from_ring_buffer(s, out->extended_data, (int)to_output,
-                                              nb_channels, is_planar, bytes_per_sample);
+                                              nb_channels, is_planar, bytes_per_sample, 0);
 
                         /* Now add entire new frame to ring */
                         copy_to_ring_buffer(s, frame, nb_channels, is_planar);
@@ -779,7 +783,7 @@ static int activate(AVFilterContext *ctx)
                         /* Read delayed samples from ring */
                         if (from_ring > 0)
                             read_from_ring_buffer(s, out->extended_data, from_ring,
-                                                  nb_channels, is_planar, bytes_per_sample);
+                                                  nb_channels, is_planar, bytes_per_sample, 0);
 
                         /* Copy excess directly from new frame (beyond delay capacity) */
                         if (from_frame > 0) {
