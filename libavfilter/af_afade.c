@@ -575,8 +575,10 @@ static int process_overlap_crossfade(AVFilterContext *ctx, const int idx1)
                 (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
             av_frame_free(&temp);
 
-            if (s->crossfade_pos >= s->ring_filled)
+            if (s->crossfade_pos >= s->ring_filled) {
                 s->crossfade_active = 0;
+                ff_outlink_set_status(outlink, status, s->pts);
+            }
 
             return ff_filter_frame(outlink, out);
         }
@@ -785,17 +787,18 @@ static int activate(AVFilterContext *ctx)
                             read_from_ring_buffer(s, out->extended_data, from_ring,
                                                   nb_channels, is_planar, bytes_per_sample, 0);
 
-                        /* Copy excess directly from new frame (beyond delay capacity) */
+                        /* Copy excess directly from beginning of new frame (these samples
+                         * cannot be delayed - they would be pushed out before being read).
+                         * For FIFO correctness, earliest samples bypass delay first. */
                         if (from_frame > 0) {
-                            int offset = frame->nb_samples - from_frame;
                             if (is_planar) {
                                 for (int c = 0; c < nb_channels; c++)
                                     memcpy(out->extended_data[c] + from_ring * bytes_per_sample,
-                                           frame->extended_data[c] + offset * bytes_per_sample,
+                                           frame->extended_data[c],
                                            from_frame * bytes_per_sample);
                             } else {
                                 memcpy(out->extended_data[0] + from_ring * nb_channels * bytes_per_sample,
-                                       frame->extended_data[0] + offset * nb_channels * bytes_per_sample,
+                                       frame->extended_data[0],
                                        from_frame * nb_channels * bytes_per_sample);
                             }
                         }
