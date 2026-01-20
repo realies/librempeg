@@ -542,22 +542,20 @@ static int activate(AVFilterContext *ctx)
          * For overlap mode, use incremental crossfade to reduce memory.
          * For non-overlap mode, use original blocking behavior. */
         if (s->overlap) {
-            int available1 = ff_inlink_queued_samples(ctx->inputs[1]);
-            if (available1 > 0) {
-                /* Start incremental crossfade */
+            int64_t available1 = ff_inlink_queued_samples(ctx->inputs[1]);
+            /* Wait for nb_samples from input 1 (or EOF) before starting crossfade */
+            if (available1 >= s->nb_samples) {
+                /* Have all samples, start incremental crossfade */
                 s->crossfade_in_progress = 1;
                 s->crossfade_offset = 0;
-                return pass_crossfade_chunk(ctx, FFMIN3(nb_samples, available1, s->nb_samples));
+                return pass_crossfade_chunk(ctx, FFMIN(8192, (int)s->nb_samples));
+            } else if (check_input(ctx->inputs[1])) {
+                /* Input 1 ended before providing nb_samples */
+                s->status[1] = AVERROR_EOF;
+                ff_outlink_set_status(outlink, AVERROR_EOF, AV_NOPTS_VALUE);
+                return 0;
             } else if (ff_outlink_frame_wanted(outlink)) {
-                /* Check if input 1 ended before crossfade could start */
-                if (check_input(ctx->inputs[1])) {
-                    s->status[1] = AVERROR_EOF;
-                    ff_outlink_set_status(outlink, AVERROR_EOF, AV_NOPTS_VALUE);
-                    return 0;
-                }
-                /* Start crossfade mode, request input 1 */
-                s->crossfade_in_progress = 1;
-                s->crossfade_offset = 0;
+                /* Request more samples from input 1 */
                 ff_inlink_request_frame(ctx->inputs[1]);
                 return 0;
             }
