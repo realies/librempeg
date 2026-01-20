@@ -54,7 +54,8 @@ typedef struct AudioFadeContext {
                           int nb_samples, int channels, double unity);
     void (*crossfade_samples)(uint8_t **dst, uint8_t * const *cf0,
                               uint8_t * const *cf1,
-                              int nb_samples, int channels,
+                              int nb_samples, int64_t total_samples,
+                              int64_t offset, int channels,
                               int curve0, int curve1);
 } AudioFadeContext;
 
@@ -362,6 +363,8 @@ static int pass_samples(AVFilterLink *inlink, AVFilterLink *outlink, unsigned nb
     return ff_filter_frame(outlink, in);
 }
 
+#define CROSSFADE_CHUNK_SIZE 8192
+
 static int pass_crossfade(AVFilterContext *ctx)
 {
     AudioFadeContext *s = ctx->priv;
@@ -370,33 +373,50 @@ static int pass_crossfade(AVFilterContext *ctx)
     int ret;
 
     if (s->overlap) {
-        out = ff_get_audio_buffer(outlink, s->nb_samples);
-        if (!out)
-            return AVERROR(ENOMEM);
+        int64_t offset = 0;
 
-        ret = ff_inlink_consume_samples(ctx->inputs[0], s->nb_samples, s->nb_samples, &cf[0]);
-        if (ret < 0) {
-            av_frame_free(&out);
-            return ret;
+        while (offset < s->nb_samples) {
+            int chunk = FFMIN(CROSSFADE_CHUNK_SIZE, (int)(s->nb_samples - offset));
+
+            out = ff_get_audio_buffer(outlink, chunk);
+            if (!out)
+                return AVERROR(ENOMEM);
+
+            ret = ff_inlink_consume_samples(ctx->inputs[0], chunk, chunk, &cf[0]);
+            if (ret < 0) {
+                av_frame_free(&out);
+                return ret;
+            }
+
+            ret = ff_inlink_consume_samples(ctx->inputs[1], chunk, chunk, &cf[1]);
+            if (ret < 0) {
+                av_frame_free(&out);
+                ff_graph_frame_free(ctx, &cf[0]);
+                return ret;
+            }
+
+            s->crossfade_samples(out->extended_data, cf[0]->extended_data,
+                                 cf[1]->extended_data,
+                                 chunk, s->nb_samples, offset,
+                                 out->ch_layout.nb_channels,
+                                 s->curve, s->curve2);
+            out->pts = s->pts;
+            s->pts += av_rescale_q(chunk,
+                (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
+
+            ff_graph_frame_free(ctx, &cf[0]);
+            ff_graph_frame_free(ctx, &cf[1]);
+            cf[0] = cf[1] = NULL;
+
+            ret = ff_filter_frame(outlink, out);
+            if (ret < 0)
+                return ret;
+
+            offset += chunk;
         }
 
-        ret = ff_inlink_consume_samples(ctx->inputs[1], s->nb_samples, s->nb_samples, &cf[1]);
-        if (ret < 0) {
-            av_frame_free(&out);
-            return ret;
-        }
-
-        s->crossfade_samples(out->extended_data, cf[0]->extended_data,
-                             cf[1]->extended_data,
-                             s->nb_samples, out->ch_layout.nb_channels,
-                             s->curve, s->curve2);
-        out->pts = s->pts;
-        s->pts += av_rescale_q(s->nb_samples,
-            (AVRational){ 1, outlink->sample_rate }, outlink->time_base);
         s->passthrough = 1;
-        ff_graph_frame_free(ctx, &cf[0]);
-        ff_graph_frame_free(ctx, &cf[1]);
-        return ff_filter_frame(outlink, out);
+        return 0;
     } else {
         out = ff_get_audio_buffer(outlink, s->nb_samples);
         if (!out)
